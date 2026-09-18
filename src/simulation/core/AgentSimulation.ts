@@ -1,5 +1,6 @@
 import { AgentNode, AgenticSystem, getAllAgents } from '../../data/agents';
 import { useCoreStore } from '../../integration/store/coreStore';
+import { isRemoteMode } from '../../integration/transport/transportStore';
 import { AgentHost } from './AgentHost';
 import { useUiStore } from '../../integration/store/uiStore';
 
@@ -25,6 +26,10 @@ export class AgentSimulation {
   }
 
   private startStateMonitoring() {
+    // DISARM (remote mode): the external board is the only writer of the board state and
+    // the external agents are the only "brains". No heartbeat, no store triggers, no spark.
+    if (isRemoteMode()) return;
+
     // 1. Heartbeat safety net (Periodically check for scheduled tasks and empty boards)
     this.heartbeatInterval = setInterval(() => {
       const state = useCoreStore.getState();
@@ -66,6 +71,8 @@ export class AgentSimulation {
 
   /** Central method to check for and start available tasks. */
   public processScheduledTasks() {
+    if (isRemoteMode()) return;
+
     const state = useCoreStore.getState();
     if (state.phase !== 'working') return;
 
@@ -82,6 +89,8 @@ export class AgentSimulation {
   }
 
   private async triggerAutonomousStrategy() {
+    if (isRemoteMode()) return;
+
     const lead = this.getAgent(1);
     const ui = useUiStore.getState();
     const core = useCoreStore.getState();
@@ -128,6 +137,8 @@ export class AgentSimulation {
   }
 
   private async checkProjectCompletion() {
+    if (isRemoteMode()) return;
+
     const state = useCoreStore.getState();
     const allTasksFinished = state.tasks.length > 0 && state.tasks.every(t => t.status === 'done');
     
@@ -157,6 +168,10 @@ export class AgentSimulation {
 
 
   public async handleUserMessage(agentIndex: number, text: string) {
+    // Remote mode has no local brain: the message must travel to the external board
+    // (egress seam) instead of being answered by Gemini.
+    if (isRemoteMode()) return null;
+
     const agent = this.getAgent(agentIndex);
     if (!agent || !agent.canChat()) return null;
     const response = await agent.think(text, { isChat: true });

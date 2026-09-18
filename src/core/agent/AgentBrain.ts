@@ -3,6 +3,7 @@ import { GeminiProvider } from '../llm/providers/GeminiProvider';
 import { useUiStore } from '../../integration/store/uiStore';
 import { useCoreStore } from '../../integration/store/coreStore';
 import { useTeamStore } from '../../integration/store/teamStore';
+import { isRemoteMode } from '../../integration/transport/transportStore';
 import { ToolRegistry } from './ToolRegistry';
 import { PromptBuilder } from './PromptBuilder';
 import { AGENTIC_SETS, AgentNode } from '../../data/agents';
@@ -32,6 +33,12 @@ export class AgentBrain {
 
   public async think(prompt: string, options: ThinkOptions = {}): Promise<{ text: string, toolCalls: any[] }> {
     if (this.isThinking) return { text: '', toolCalls: [] };
+
+    // DISARM (remote mode): no local reasoning and no Gemini call — the external board
+    // owns the conversation and pushes it back as `agent.message` / `task.*` events.
+    // Returning before the API-key check also prevents the BYOK modal from popping up.
+    if (isRemoteMode()) return { text: '', toolCalls: [] };
+
     this.isThinking = true;
 
     try {
@@ -191,6 +198,8 @@ export class AgentBrain {
   }
 
   private async handleFinalAssetGeneration(prompt: string) {
+    if (isRemoteMode()) return;
+
     const core = useCoreStore.getState();
     const teamId = useTeamStore.getState().selectedAgentSetId;
     const activeTeam = useTeamStore.getState().customSystems.find(s => s.id === teamId)
@@ -223,6 +232,9 @@ export class AgentBrain {
   }
 
   public async processFinalAsset(prompt: string, options: any) {
+    // Remote mode: the final asset arrives through the `project.asset_ready` event.
+    if (isRemoteMode()) return;
+
     const core = useCoreStore.getState();
     const teamId = useTeamStore.getState().selectedAgentSetId;
     const activeTeam = useTeamStore.getState().customSystems.find(s => s.id === teamId)

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { LLMMessage, LLMTokenUsage, LLMToolCall, LLMToolDefinition } from '../../core/llm/types';
+import { AgentState } from '../../types';
 import { DEFAULT_MODELS, AVAILABLE_MODELS } from '../../core/llm/constants';
 import { calculateCost } from '../../core/llm/pricing';
 import { useTeamStore } from './teamStore';
@@ -36,6 +37,25 @@ export interface ActionLogEntry {
   agentIndex: number
   action: string
   taskId?: string
+}
+
+/**
+ * Full-board replacement coming from an external source (`board.snapshot`).
+ * Task ids are authoritative: they are the join key for revisions, draftOutput,
+ * reviewComments and boardroomHistories, so they are never regenerated.
+ */
+export interface SnapshotTaskInput extends Omit<Task, 'revisions' | 'createdAt' | 'updatedAt'> {
+  id: string
+  revisions?: TaskRevision[]
+  createdAt?: number
+  updatedAt?: number
+}
+
+export interface SnapshotPayload {
+  tasks: SnapshotTaskInput[]
+  phase?: ProjectPhase
+  userBrief?: string
+  agentStatuses?: Record<number, AgentState>
 }
 
 export interface DebugLogEntryBase {
@@ -121,13 +141,20 @@ interface CoreState {
   setPendingOutputParams: (params: any) => void;
 
   // ── Actions — Tasks ───────────────────────────────────────────
-  addTask: (task: Omit<Task, 'id' | 'revisions' | 'createdAt' | 'updatedAt'>) => Task;
+  /** `id` may be provided by an external board (remote mode); otherwise it is generated locally. */
+  addTask: (task: Omit<Task, 'id' | 'revisions' | 'createdAt' | 'updatedAt'> & { id?: string; revisions?: TaskRevision[]; createdAt?: number; updatedAt?: number }) => Task;
+  /** Replace the whole board from an external snapshot (`board.snapshot` event). */
+  applySnapshot: (snapshot: SnapshotPayload) => void;
   removeTask: (taskId: string) => void;
-  updateTaskStatus: (taskId: string, status: TaskStatus) => void;
+  /** `force` bypasses the local anti-regression guard (used by external events only). */
+  updateTaskStatus: (taskId: string, status: TaskStatus, options?: { force?: boolean }) => void;
+  /** Explicitly re-open a `done` task (external re-dispatch); the local guard stays in place. */
+  reopenTask: (taskId: string, status: TaskStatus) => void;
   submitTaskForReview: (taskId: string, draftOutput?: string) => void;
   setTaskOutput: (taskId: string, output: string) => void;
   approveTask: (taskId: string) => void;
-  rejectTask: (taskId: string, comments: string) => void;
+  /** `writeHistory: false` keeps the server as the single owner of agent history (remote mode). */
+  rejectTask: (taskId: string, comments: string, options?: { writeHistory?: boolean }) => void;
 
   // ── Actions — Log ─────────────────────────────────────────────
   addLogEntry: (entry: Omit<ActionLogEntry, 'id' | 'timestamp'>) => void;
@@ -231,14 +258,39 @@ export const useCoreStore = create<CoreState>()(
       addTask: (task) => {
         const newTask: Task = {
           ...task,
-          id: `task_${uid()}`,
-          revisions: [],
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
+          // External ids (remote mode) are authoritative; only generate one when absent.
+          id: task.id || `task_${uid()}`,
+          revisions: task.revisions ?? [],
+          createdAt: task.createdAt ?? Date.now(),
+          updatedAt: task.updatedAt ?? Date.now(),
         }
         set((s) => ({ tasks: [...s.tasks, newTask] }))
         return newTask
       },
+
+      applySnapshot: (snapshot) =>
+        set((s) => {
+          const now = Date.now();
+          const tasks: Task[] = snapshot.tasks.map((t) => ({
+            ...t,
+            revisions: t.revisions ?? [],
+            createdAt: t.createdAt ?? now,
+            updatedAt: t.updatedAt ?? now,
+          }));
+
+          if (snapshot.agentStatuses) {
+            const ui = useUiStore.getState();
+            Object.entries(snapshot.agentStatuses).forEach(([key, status]) => {
+              ui.setAgentStatus(parseInt(key, 10), status);
+            });
+          }
+
+          return {
+            tasks,
+            phase: snapshot.phase ?? s.phase,
+            userBrief: snapshot.userBrief ?? s.userBrief,
+          };
+        }),
 
       removeTask: (taskId) =>
         set((s) => {
@@ -259,13 +311,14 @@ export const useCoreStore = create<CoreState>()(
           };
         }),
 
-      updateTaskStatus: (taskId, status) =>
+      updateTaskStatus: (taskId, status, options) =>
         set((s) => {
           const task = s.tasks.find((t) => t.id === taskId);
           if (!task) return {};
 
           // Safety check: Cannot move back to 'in_progress' or 'on_hold' if already 'done'
-          if (task.status === 'done' && (status === 'in_progress' || status === 'on_hold')) {
+          // (`force` is reserved for external board events that intentionally reopen a task).
+          if (!options?.force && task.status === 'done' && (status === 'in_progress' || status === 'on_hold')) {
             return {};
           }
 
@@ -277,6 +330,15 @@ export const useCoreStore = create<CoreState>()(
             tasks: newTasks,
           };
         }),
+
+      reopenTask: (taskId, status) =>
+        set((s) => ({
+          tasks: s.tasks.map((t) =>
+            t.id === taskId
+              ? { ...t, status, draftOutput: undefined, updatedAt: Date.now() }
+              : t
+          ),
+        })),
 
       submitTaskForReview: (taskId, draftOutput) =>
         set((s) => ({
@@ -312,21 +374,26 @@ export const useCoreStore = create<CoreState>()(
         });
       },
 
-      rejectTask: (taskId, comments) => {
+      rejectTask: (taskId, comments, options) => {
         set((s) => {
           const task = s.tasks.find(t => t.id === taskId);
           if (!task) return {};
 
           useUiStore.getState().setAgentStatus(task.assignedAgentId, 'idle');
-          
+
+          // Remote mode: the external board owns the conversation, so the rejection text
+          // arrives as an `agent.message` event instead of being written here (§7.4).
+          const writeHistory = options?.writeHistory !== false;
           const history = s.agentHistories[task.assignedAgentId] || [];
-          const updatedHistory = [
-            ...history,
-            {
-              role: 'user' as 'user',
-              content: `Rejected. Reason: ${comments}`,
-            }
-          ];
+          const updatedHistory = writeHistory
+            ? [
+              ...history,
+              {
+                role: 'user' as 'user',
+                content: `Rejected. Reason: ${comments}`,
+              }
+            ]
+            : history;
 
           return {
             tasks: s.tasks.map((t) =>

@@ -15,6 +15,7 @@ import SimulationView from './interface/SimulationView';
 import { VisualConfigurator } from './interface/VisualConfigurator/VisualConfigurator';
 import { SceneContext } from './simulation/SceneContext';
 import { SceneManager } from './simulation/SceneManager';
+import { kanbanTransport } from './integration/transport/KanbanTransport';
 
 
 const App: React.FC = () => {
@@ -54,6 +55,16 @@ const App: React.FC = () => {
       window.removeEventListener('mouseup', stopResizing);
     };
   }, [resize, stopResizing]);
+
+  /**
+   * External kanban event transport (Seam A — Ingress). Mounted here, at the app root,
+   * so it stays alive even if the WebGPU canvas fails to initialise. It is a no-op in
+   * local mode; in remote mode it is the only writer of `coreStore`/`uiStore` state.
+   */
+  useEffect(() => {
+    kanbanTransport.start();
+    return () => kanbanTransport.stop();
+  }, []);
 
   useEffect(() => {
     if (canvasRef.current && !managerRef.current) {

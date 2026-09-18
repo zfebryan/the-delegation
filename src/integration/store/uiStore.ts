@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { getAllAgents } from '../../data/agents';
-import { AgentState, CharacterState } from '../../types';
+import { AgentState, CharacterState, ConnectionState } from '../../types';
 import { useTeamStore, getActiveAgentSet } from './teamStore';
 import { DEFAULT_MODELS } from '../../core/llm/constants';
 
@@ -32,6 +32,9 @@ export const useUiStore = create<CharacterState>()(
 
     activeAuditTaskId: null,
     setActiveAuditTaskId: (taskId: string | null) => set({ activeAuditTaskId: taskId }),
+
+    connectionState: 'disabled',
+    setConnectionState: (connectionState: ConnectionState) => set({ connectionState }),
 
     llmConfig: (() => {
       try {

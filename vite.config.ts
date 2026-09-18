@@ -10,6 +10,11 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      // External kanban board transport (see src/integration/transport/config.ts).
+      // Both the VITE_ prefixed and the plain name are accepted, so a value set only in
+      // the shell (e.g. CI/Vercel) still reaches the client bundle.
+      'import.meta.env.VITE_KANBAN_WS_URL': JSON.stringify(env.VITE_KANBAN_WS_URL ?? env.KANBAN_WS_URL ?? ''),
+      'import.meta.env.VITE_KANBAN_TRANSPORT_MODE': JSON.stringify(env.VITE_KANBAN_TRANSPORT_MODE ?? env.KANBAN_TRANSPORT_MODE ?? ''),
     },
     resolve: {
       alias: {
