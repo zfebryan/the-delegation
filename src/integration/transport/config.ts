@@ -1,3 +1,4 @@
+import { DEFAULT_AGENT_MAP, parseAgentMap } from './BridgeAdapter';
 import { TransportConfig, TransportMode } from './types';
 
 /**
@@ -29,6 +30,9 @@ const readBuildEnv = (): Record<string, unknown> => ({
   VITE_KANBAN_WS_HEARTBEAT_MS: import.meta.env.VITE_KANBAN_WS_HEARTBEAT_MS,
   VITE_KANBAN_WS_HEARTBEAT_TIMEOUT_MS: import.meta.env.VITE_KANBAN_WS_HEARTBEAT_TIMEOUT_MS,
   VITE_KANBAN_WS_DEDUPE_SIZE: import.meta.env.VITE_KANBAN_WS_DEDUPE_SIZE,
+  VITE_KANBAN_AGENT_MAP: import.meta.env.VITE_KANBAN_AGENT_MAP,
+  VITE_KANBAN_BRIDGE_ADAPTER: import.meta.env.VITE_KANBAN_BRIDGE_ADAPTER,
+  VITE_KANBAN_BACKLOG_MODE: import.meta.env.VITE_KANBAN_BACKLOG_MODE,
 });
 
 export function resolveTransportConfig(
@@ -52,5 +56,11 @@ export function resolveTransportConfig(
     heartbeatIntervalMs: asPositiveNumber(env.VITE_KANBAN_WS_HEARTBEAT_MS, 15000),
     heartbeatTimeoutMs: asPositiveNumber(env.VITE_KANBAN_WS_HEARTBEAT_TIMEOUT_MS, 10000),
     dedupeCacheSize: asPositiveNumber(env.VITE_KANBAN_WS_DEDUPE_SIZE, 500),
+    // `kanban-ws-bridge` speaks its own flat frame format; the adapter is what makes those
+    // frames land in the §6.2 envelope. `off` keeps the raw §6.2 path for a future server.
+    bridgeAdapter: String(env.VITE_KANBAN_BRIDGE_ADAPTER ?? '').trim().toLowerCase() === 'off' ? 'off' : 'auto',
+    backlogMode: String(env.VITE_KANBAN_BACKLOG_MODE ?? '').trim().toLowerCase() === 'ignore' ? 'ignore' : 'snapshot',
+    // Explicit table beats guessing: see BridgeAdapter header + docs §7.
+    agentMap: { ...DEFAULT_AGENT_MAP, ...parseAgentMap(env.VITE_KANBAN_AGENT_MAP as string) },
   };
 }

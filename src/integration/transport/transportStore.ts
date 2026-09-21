@@ -23,10 +23,13 @@ interface TransportState {
   ignoredEvents: number;
   rejectedEvents: number;
   snapshotRequests: number;
+  /** Negative acknowledgements sent for dropped bridge events (unmapped assignee, …). */
+  nackedEvents: number;
   lastError: string | null;
   setConnectionState: (state: ConnectionState) => void;
   recordEvent: (result: MapResult, seq?: number) => void;
   noteSnapshotRequest: () => void;
+  noteNack: () => void;
   setLastError: (message: string | null) => void;
   resetCounters: () => void;
 }
@@ -42,6 +45,7 @@ export const useTransportStore = create<TransportState>()((set) => ({
   ignoredEvents: 0,
   rejectedEvents: 0,
   snapshotRequests: 0,
+  nackedEvents: 0,
   lastError: null,
 
   setConnectionState: (connectionState) => {
@@ -61,6 +65,7 @@ export const useTransportStore = create<TransportState>()((set) => ({
     })),
 
   noteSnapshotRequest: () => set((s) => ({ snapshotRequests: s.snapshotRequests + 1 })),
+  noteNack: () => set((s) => ({ nackedEvents: s.nackedEvents + 1 })),
   setLastError: (lastError) => set({ lastError }),
   resetCounters: () =>
     set({ receivedEvents: 0, appliedEvents: 0, ignoredEvents: 0, rejectedEvents: 0 }),

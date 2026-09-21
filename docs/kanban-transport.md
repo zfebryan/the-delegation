@@ -14,6 +14,9 @@ bergerak sebagai refleks dari `coreStore.tasks` dan `uiStore.agentStatuses`.
 | `VITE_KANBAN_WS_RECONNECT_MIN_MS` / `_MAX_MS` | Batas backoff reconnect (default 500 / 15000). |
 | `VITE_KANBAN_WS_HEARTBEAT_MS` / `_TIMEOUT_MS` | Interval ping dan ambang pong (default 15000 / 10000). |
 | `VITE_KANBAN_WS_DEDUPE_SIZE` | Ukuran cache id event (default 500). |
+| `VITE_KANBAN_AGENT_MAP` | Tabel `assignee` → `agentIndex` (default `dev:2,qa:3`), lihat §7.1. |
+| `VITE_KANBAN_BRIDGE_ADAPTER` | `auto` (default) = frame `kanban-ws-bridge` diterjemahkan adapter; `off` = hanya amplop §6.2. |
+| `VITE_KANBAN_BACKLOG_MODE` | `snapshot` (default) = frame `backlog` dirangkum jadi `board.snapshot`; `ignore` = dibuang. |
 
 `vite.config.ts` juga menerima nama tanpa prefix (`KANBAN_WS_URL`, `KANBAN_TRANSPORT_MODE`)
 sehingga nilai yang hanya ada di shell/CI tetap ikut ter-bundle. Lihat `.env.example`.
@@ -35,8 +38,12 @@ Akibatnya `debugLog` tetap kosong dan tidak ada request keluar ke Gemini di mode
 
 ## 3. Ingress: event → aksi store
 
-Alur: `wsClient` → `EventDedupe` (id + gap `seq`) → `KanbanEventMapper` → aksi store.
+Alur: `wsClient` → **`BridgeAdapter`** (frame datar `kanban-ws-bridge` → amplop §6.2) → `EventDedupe`
+(id + gap `seq`) → `KanbanEventMapper` → aksi store.
 Gap `seq`, reconnect, dan pergantian tim memicu `board.snapshot.request` (resync).
+Adapter hanya menyentuh frame yang dikenal sebagai milik bridge; amplop §6.2 apa adanya
+dilewatkan tanpa perubahan (`passthrough`), jadi server §6.2 sungguhan tetap bisa dipakai
+(`VITE_KANBAN_BRIDGE_ADAPTER=off` untuk memaksa jalur itu).
 
 | Event | Aksi store |
 |---|---|
@@ -96,26 +103,30 @@ verifikasi dilakukan dengan membaca ulang kode + harness Node yang dibundel `esb
 (dependensi transitif vite, tanpa `npm install` tambahan):
 
 ```bash
-# 1) mapper/dedupe/config murni, store palsu (29 assertion)
+# 1) config + dedupe + mapper murni, store palsu (29 assertion)
 ./node_modules/.bin/esbuild scripts/kanban-transport/smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-smoke.mjs && node /tmp/kb-smoke.mjs
 
-# 2) klien nyata terhadap bridge nyata (butuh bridge jalan di :8000)
+# 2) adapter bridge → §6.2: pemetaan assignee/status, backlog, NACK, dedupe (36 assertion)
+./node_modules/.bin/esbuild scripts/kanban-transport/bridge-smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-bridge.mjs && node /tmp/kb-bridge.mjs
+
+# 3) klien nyata terhadap bridge nyata melalui adapter (butuh bridge jalan di :8000)
 ./node_modules/.bin/esbuild scripts/kanban-transport/live.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-live.mjs && node /tmp/kb-live.mjs ws://127.0.0.1:8000/ws
 
-# 3) heartbeat dengan WebSocket palsu (peer diam vs peer yang menjawab pong)
+# 4) heartbeat dengan WebSocket palsu (peer diam vs peer yang menjawab pong)
 ./node_modules/.bin/esbuild scripts/kanban-transport/heartbeat.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-hb.mjs && node /tmp/kb-hb.mjs
 ```
 
-Ketiga harness TypeScript di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut
+Keempat harness TypeScript di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut
 menambah diagnostik ke `npm run lint`, dan tidak menarik dependensi baru (`esbuild` ikut bersama
 vite). `old-rule-probe.mjs` (JS murni, `node` langsung) hanya untuk mereproduksi aturan liveness
 lama; lihat §5.
 
 Hasil terakhir (host 4 GB, bridge hidup di `ws://127.0.0.1:8000/ws`): harness (1)
-`ALL CHECKS PASSED`; (2) states `["connecting","online","err:peer never answered ping; …","offline"]`
-(`offline` terakhir karena `dispose()` di akhir skrip), 0 reconnect, 1 event `backlog` masuk yang
-dihitung `ignored:unknown_type`; (3) peer diam → tetap `online` tanpa close paksa, peer yang
-menjawab `pong` lalu diam → `heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
+`ALL CHECKS PASSED` (29 assertion); (2) `ALL CHECKS PASSED` (36 assertion, adapter); (3) lihat
+§7.6 — frame `backlog` nyata jadi `applied:board.snapshot`, event di dalamnya (`task_added`,
+`status_changed`) jadi `applied:task.created` / `applied:task.status_changed`, 0 reconnect;
+(4) peer diam → tetap `online` tanpa close paksa, peer yang menjawab `pong` lalu diam →
+`heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
 
 Sebelum merge, jalankan `npm ci && npm run lint && npm run build` di mesin yang punya RAM cukup:
 
@@ -126,21 +137,86 @@ VITE_KANBAN_WS_URL=ws://127.0.0.1:8000/ws npm run build    # mode remote, URL ik
 
 Indikator koneksi muncul di header (`board online|connecting|offline`) hanya saat mode remote.
 
-## 7. Catatan kompatibilitas dengan `kanban-ws-bridge`
+## 7. Adapter `kanban-ws-bridge` → amplop §6.2
 
-Bridge yang ada (repo `criminals-sandbox`, service `kanban-ws-bridge`) belum bisa langsung
-menggerakkan board ini — kontraknya berbeda dari tabel §3:
+Bridge di repo `criminals-sandbox` (service `kanban-ws-bridge`) memakai format frame sendiri:
 
 | Aspek | Bridge | Kontrak §3 |
 |---|---|---|
-| Nama event | `task_added`, `status_changed`, `task_updated`, `task_removed`, `backlog`, `poll_error` | `task.created`, `task.status_changed`, … |
+| Nama event | `task_added`, `status_changed`, `task_updated`, `task_removed`, `backlog`, `poll_error`, `poll_recovered`, `keepalive` | `task.created`, `task.status_changed`, … |
 | Amplop | datar (`task_id`, `task`, `changes`, `to_status`) | `{v,id,type,seq,ts,projectId,agentIndex?,taskId?,payload}` |
 | Id task | id kartu Hermes (`t_29bcaba1`) | bebas, dipakai apa adanya oleh `addTask`/`applySnapshot` |
 | Pemilik task | `assignee` = nama profil (`dev`) | `assignedAgentId` = index integer tim aktif |
-| Status | enum Hermes kanban (todo/ready/running/… ) | `scheduled/on_hold/in_progress/done` |
+| Status | enum Hermes kanban (todo/ready/running/blocked/review/done) | `scheduled/on_hold/in_progress/done` |
 | Alive | `{type:'keepalive'}` tiap 30s idle | `pong` |
+| `seq`/`ts` | **ada** per event (`poller._emit()`), hanya pembungkus `backlog` yang tidak punya | `seq`/`ts` opsional |
 
-Karena itu setiap event bridge saat ini terhitung `ignored (unknown_type)` — terverifikasi pada
-harness (2): event `backlog` diterima, tidak ada aksi store. Adapter (nama event + terjemahan
-status + pemetaan `assignee` ke index agen) sengaja **tidak** dibuat di sini karena pemetaan
-`assignee → agentIndex` adalah keputusan desain, bukan mekanis; lihat task lanjutan di board.
+`src/integration/transport/BridgeAdapter.ts` menjembatani keduanya; ia murni (tanpa socket/store)
+dan dipanggil `KanbanTransport.handleFrame()` sebelum dedupe/mapper.
+
+### 7.1 `assignee` → `agentIndex`: tabel eksplisit (bukan urutan tim)
+`VITE_KANBAN_AGENT_MAP=dev:2,qa:3` (default kode sama; index `0`=user, `1`=lead, `2..4`=subagent).
+Urutan `getAllAgents(getActiveAgentSet())` ditolak sebagai sumber pemetaan karena berbeda antar
+team set (1 agen di `strategy-coach`, index sampai 5 di `music-studio`), jadi "orang ke-N" bukan
+identitas yang stabil — salah petakan berarti karakter 3D berjalan ke meja/boardroom yang salah.
+
+Dua gerbang: nama harus ada di tabel (`unknown_assignee`), dan index hasilnya harus ada di tim
+aktif (`agent_not_in_team`). Gagal salah satu → event **dibuang** dan `event.nack` dikirim
+(`{type:'event.nack', reason, bridgeType, taskId, assignee}`); NACK di-dedupe per
+reason/task dan dibatasi 200 entri per sesi. Bridge mengabaikan frame masuk, jadi NACK adalah
+observabilitas (counter `nackedEvents` di `transportStore`), bukan flow control.
+
+### 7.2 Terjemahan status (dua arah, arah balik lossy)
+| Hermes kanban | §6.2 `TaskStatus` |
+|---|---|
+| `todo`, `ready`, `triage` | `scheduled` |
+| `running` | `in_progress` |
+| `blocked`, `review` | `on_hold` |
+| `done` | `done` |
+| lain (`archived`, …) | **tidak ditebak**: event dibuang + NACK `unknown_status` |
+
+Balik (untuk egress nanti): `scheduled → ready`, `in_progress → running`, `on_hold → review`,
+`done → done`. Lossy dan disengaja: `todo`/`ready` (dan `blocked`/`review`) bertemu di satu nilai.
+`blocked`/`review` → `on_hold` dipilih karena §7.8 dokumen riset: `on_hold` = menunggu manusia
+**dan** = di boardroom, dan kedua status Hermes itu memang menunggu manusia.
+
+### 7.3 Amplop & `seq`/`id`
+Bridge memang mengirim `seq` (naik monoton per proses bridge) dan `ts` (Unix detik) di setiap
+event — terverifikasi pada bridge nyata (`GET /events`). Jadi:
+`id` disintesis `bridge:<seq>` (fallback `bridge:<type>:<taskId>:<ts>`), `seq` diteruskan apa
+adanya, `ts` dikonversi detik → milidetik. Dedupe **tetap aktif** (replay `backlog` setelah
+reconnect terdeteksi duplikat) dan gap-detection `seq` **tetap aktif** (event bridge yang hilang
+memang mungkin). Konsekuensinya `requestSnapshot('seq_gap')` tetap dikirim, tetapi bridge belum
+menjawabnya (§7.5).
+
+### 7.4 Batch backlog → `board.snapshot`
+Frame `backlog` berisi 50 event terakhir (bukan state task). Adapter merangkumnya jadi **satu**
+`board.snapshot`: state terakhir per `task_id` (last-write-wins), task yang terakhir muncul sebagai
+`task_removed` dibuang, `phase` diturunkan (`semua done → done`, ada `in_progress`/`on_hold` →
+`working`, sisanya `idle`), dan `seq` diisi `seq` tertinggi yang di-replay supaya event live
+pertama terhitung contiguous (bukan baseline baru). Bisa dimatikan dengan
+`VITE_KANBAN_BACKLOG_MODE=ignore` (stream murni delta).
+
+### 7.5 Gap yang diketahui (bukan bug)
+- `task_updated` / `task_removed` **tidak** dipetakan: kontrak §6.2 tidak punya `task.updated` /
+  `task.removed`, dan `removeTask` lokal menendang `phase → done` sebagai efek samping
+  (risiko #3 dokumen riset). Keduanya dibuang + NACK (`non_status_change_not_supported` /
+  `removal_not_supported`) supaya divergensi terlihat, bukan senyap. Efek nyata: perubahan
+  `title`/`priority`/`assignee` pada kartu yang sudah ada tidak mengubah board 3D.
+- `poll_error` / `poll_recovered` dicatat sebagai `ignored` (`bridge_poll_error` /
+  `bridge_poll_recovered`), tidak fatal — bridge memang bisa gagal polling sesaat.
+- Bridge belum membalas `ping` dengan `pong` dan belum punya endpoint snapshot: resync
+  `board.snapshot.request` tidak dijawab. Mitigasi sementara: bootstrap dari `backlog` (§7.4).
+  Perbaikan sisi bridge sudah jadi kartu lanjutan `t_e5fc6584`.
+
+### 7.6 Verifikasi adapter (hasil nyata)
+- `scripts/kanban-transport/bridge-smoke.ts` → `ALL CHECKS PASSED` (36 assertion): tabel
+  `assignee`, tabel status dua arah, `task_added`→`task.created`, `status_changed`→
+  `task.status_changed`, `blocked`→`on_hold`, NACK untuk `unknown_assignee` /
+  `agent_not_in_team` / `unknown_status` / malformed, `task_updated`/`task_removed` ditolak
+  eksplisit, `poll_error`/`keepalive`, rangkuman `backlog` (termasuk `phase` dan baseline `seq`),
+  dedupe + gap, dan jalur ujung-ke-ujung adapter → mapper (store calls nyata).
+- `scripts/kanban-transport/live.ts` terhadap bridge nyata: 0 reconnect, frame `backlog` →
+  `applied:board.snapshot`; event di dalam backlog (payload nyata dari bridge) di-replay lewat
+  adapter yang sama → `applied:task.created` + `applied:task.status_changed` (dengan store task
+  in-memory, bukan lagi `ignored:unknown_type`).

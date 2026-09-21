@@ -39,6 +39,12 @@ export interface TransportConfig {
   heartbeatTimeoutMs: number;
   /** LRU size for event id dedupe. */
   dedupeCacheSize: number;
+  /** `auto`: route `kanban-ws-bridge` frames through the adapter; `off`: §6.2 envelopes only. */
+  bridgeAdapter: 'auto' | 'off';
+  /** What to do with the bridge `backlog` frame: summarize into `board.snapshot`, or ignore. */
+  backlogMode: 'snapshot' | 'ignore';
+  /** `assignee` (Hermes profile name) → `agentIndex` (0=user, 1=lead, 2..4=subagent). */
+  agentMap: Record<string, number>;
 }
 
 /** Outcome of mapping a single event onto store actions (used for logging/counters). */

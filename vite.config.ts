@@ -15,6 +15,9 @@ export default defineConfig(({mode}) => {
       // the shell (e.g. CI/Vercel) still reaches the client bundle.
       'import.meta.env.VITE_KANBAN_WS_URL': JSON.stringify(env.VITE_KANBAN_WS_URL ?? env.KANBAN_WS_URL ?? ''),
       'import.meta.env.VITE_KANBAN_TRANSPORT_MODE': JSON.stringify(env.VITE_KANBAN_TRANSPORT_MODE ?? env.KANBAN_TRANSPORT_MODE ?? ''),
+      'import.meta.env.VITE_KANBAN_AGENT_MAP': JSON.stringify(env.VITE_KANBAN_AGENT_MAP ?? env.KANBAN_AGENT_MAP ?? ''),
+      'import.meta.env.VITE_KANBAN_BRIDGE_ADAPTER': JSON.stringify(env.VITE_KANBAN_BRIDGE_ADAPTER ?? env.KANBAN_BRIDGE_ADAPTER ?? ''),
+      'import.meta.env.VITE_KANBAN_BACKLOG_MODE': JSON.stringify(env.VITE_KANBAN_BACKLOG_MODE ?? env.KANBAN_BACKLOG_MODE ?? ''),
     },
     resolve: {
       alias: {
