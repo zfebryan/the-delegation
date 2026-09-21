@@ -3,13 +3,15 @@ import React, { useState } from 'react';
 import packageJson from '../../package.json';
 import { useCoreStore } from '../integration/store/coreStore';
 import { useUiStore } from '../integration/store/uiStore';
+import { useTransportStore } from '../integration/transport/transportStore';
 import BYOKModal from './BYOKModal';
 import InfoModal from './InfoModal';
 
 const version = packageJson.version;
 
 const Header: React.FC = () => {
-  const { llmConfig, isBYOKOpen, setBYOKOpen } = useUiStore();
+  const { llmConfig, isBYOKOpen, setBYOKOpen, connectionState } = useUiStore();
+  const transportMode = useTransportStore((s) => s.mode);
   const { setViewMode } = useCoreStore();
   const [isInfoOpen, setIsInfoOpen] = useState(false);
   const hasKey = !!llmConfig.apiKey;
@@ -69,6 +71,24 @@ const Header: React.FC = () => {
 
       {/* Right: Global Controls */}
       <div className="flex items-center gap-3">
+
+        {transportMode === 'remote' && (
+          <div
+            className="flex items-center gap-2 px-2.5 py-1 rounded-lg border border-zinc-200 bg-zinc-50 h-9 shrink-0"
+            title={`External board transport (${connectionState})`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${connectionState === 'online'
+                ? 'bg-emerald-500'
+                : connectionState === 'connecting'
+                  ? 'bg-amber-400 animate-pulse'
+                  : 'bg-zinc-300'}`}
+            />
+            <span className="text-[10px] font-black uppercase tracking-wider text-zinc-500">
+              board {connectionState}
+            </span>
+          </div>
+        )}
 
         <button
           onClick={() => setViewMode('design')}

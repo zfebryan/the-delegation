@@ -1,6 +1,9 @@
 import type * as THREE from 'three/webgpu';
 
 import { LLMConfig } from './core/llm/types';
+import { ConnectionState } from './integration/transport/types';
+
+export type { ConnectionState };
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -36,6 +39,10 @@ export interface CharacterState {
 
   activeAuditTaskId: string | null;
   setActiveAuditTaskId: (taskId: string | null) => void;
+
+  // External kanban event transport (remote mode) — badge state, see integration/transport
+  connectionState: ConnectionState;
+  setConnectionState: (state: ConnectionState) => void;
 
   // BYOK LLM Configuration
   llmConfig: LLMConfig;
