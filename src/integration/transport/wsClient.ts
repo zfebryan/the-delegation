@@ -35,6 +35,15 @@ export class KanbanWsClient {
   private disposed = false;
   private hasConnectedOnce = false;
   private lastPongAt = 0;
+  /**
+   * True once the peer has answered a `ping` with a `pong`. Servers that keep the socket
+   * warm with their own frames (`keepalive`) or that simply stay silent (the board bridge
+   * only pushes on change) never implement this handshake — for those, a missed pong is not
+   * evidence of a dead socket, and force-closing would put the client in a reconnect loop.
+   * Without a pong-capable peer we fall back to `onclose`/`onerror` for liveness detection.
+   */
+  private peerAnswersPing = false;
+  private warnedAboutHeartbeat = false;
   private state: WsConnectionState = 'offline';
 
   constructor(private readonly options: KanbanWsClientOptions) {}
@@ -71,6 +80,8 @@ export class KanbanWsClient {
       }
       this.attempt = 0;
       this.lastPongAt = Date.now();
+      this.peerAnswersPing = false;
+      this.warnedAboutHeartbeat = false;
       this.setState('online');
       this.startHeartbeat();
 
@@ -79,6 +90,12 @@ export class KanbanWsClient {
     };
 
     socket.onmessage = (message: MessageEvent) => {
+      // Any inbound frame proves the socket is alive: servers that keep the connection
+      // warm with their own keepalive/backlog frames never answer `ping` with `pong`,
+      // and treating silence from them as a dead socket would make the client reconnect
+      // in a loop (observed against kanban-ws-bridge, which sends `keepalive`).
+      this.lastPongAt = Date.now();
+
       let parsed: any;
       try {
         parsed = typeof message.data === 'string' ? JSON.parse(message.data) : message.data;
@@ -90,13 +107,15 @@ export class KanbanWsClient {
 
       // Keepalive frames are handled here; everything else goes to the transport.
       if (parsed.type === 'pong') {
-        this.lastPongAt = Date.now();
+        this.peerAnswersPing = true;
         return;
       }
       if (parsed.type === 'ping') {
         this.sendRaw({ type: 'pong', ts: Date.now() });
         return;
       }
+      // Server-side keepalive: liveness already refreshed above, nothing to map.
+      if (parsed.type === 'keepalive') return;
 
       this.options.onEvent(parsed as KanbanEventEnvelope);
     };
@@ -163,7 +182,7 @@ export class KanbanWsClient {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this.isOpen) return;
-      if (Date.now() - this.lastPongAt > this.options.heartbeatTimeoutMs) {
+      if (this.peerAnswersPing && Date.now() - this.lastPongAt > this.options.heartbeatTimeoutMs) {
         // Dead socket: close it so `onclose` schedules a reconnect.
         this.options.onError?.('heartbeat timeout');
         try {
@@ -172,6 +191,12 @@ export class KanbanWsClient {
           /* ignore */
         }
         return;
+      }
+      if (!this.peerAnswersPing && !this.warnedAboutHeartbeat) {
+        // The peer never answered a ping: it may simply not speak the handshake (the board
+        // bridge does not), so a missed pong must not kill a healthy connection.
+        this.warnedAboutHeartbeat = true;
+        this.options.onError?.('peer never answered ping; using socket close/error for liveness');
       }
       this.sendRaw({ type: 'ping', ts: Date.now() });
     }, this.options.heartbeatIntervalMs);
