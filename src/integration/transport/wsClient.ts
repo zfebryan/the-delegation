@@ -34,7 +34,6 @@ export class KanbanWsClient {
   private attempt = 0;
   private disposed = false;
   private hasConnectedOnce = false;
-  private lastPongAt = 0;
   /**
    * True once the peer has answered a `ping` with a `pong`. Servers that keep the socket
    * warm with their own frames (`keepalive`) or that simply stay silent (the board bridge
@@ -43,6 +42,24 @@ export class KanbanWsClient {
    * Without a pong-capable peer we fall back to `onclose`/`onerror` for liveness detection.
    */
   private peerAnswersPing = false;
+  /**
+   * Pings that left the socket while the peer was still unproven (no `pong` ever seen).
+   *
+   * One unanswered ping is not evidence: the very first ping always leaves before the first
+   * `pong` can arrive, so warning on it would put a scary `lastError` on every healthy connect.
+   * The warning waits for the second one.
+   */
+  private unansweredPings = 0;
+  /**
+   * When the ping that is still waiting for a `pong` was sent (0 = nothing outstanding).
+   *
+   * `heartbeatTimeoutMs` is measured from *that* moment, not from the last pong: with the
+   * default tuning (interval 15000 > timeout 10000) comparing `now - lastPongAt` against the
+   * timeout would close a perfectly healthy socket on the second tick (~15 s), because the
+   * last pong is always one whole interval old by then. That bug is only reachable now that
+   * the bridge actually answers `ping` (before PR #12 `peerAnswersPing` never became true).
+   */
+  private awaitingPongSince = 0;
   private warnedAboutHeartbeat = false;
   private state: WsConnectionState = 'offline';
 
@@ -79,8 +96,9 @@ export class KanbanWsClient {
         return;
       }
       this.attempt = 0;
-      this.lastPongAt = Date.now();
       this.peerAnswersPing = false;
+      this.awaitingPongSince = 0;
+      this.unansweredPings = 0;
       this.warnedAboutHeartbeat = false;
       this.setState('online');
       this.startHeartbeat();
@@ -90,12 +108,6 @@ export class KanbanWsClient {
     };
 
     socket.onmessage = (message: MessageEvent) => {
-      // Any inbound frame proves the socket is alive: servers that keep the connection
-      // warm with their own keepalive/backlog frames never answer `ping` with `pong`,
-      // and treating silence from them as a dead socket would make the client reconnect
-      // in a loop (observed against kanban-ws-bridge, which sends `keepalive`).
-      this.lastPongAt = Date.now();
-
       let parsed: any;
       try {
         parsed = typeof message.data === 'string' ? JSON.parse(message.data) : message.data;
@@ -108,6 +120,9 @@ export class KanbanWsClient {
       // Keepalive frames are handled here; everything else goes to the transport.
       if (parsed.type === 'pong') {
         this.peerAnswersPing = true;
+        // The outstanding ping is answered: the next tick may send a new one.
+        this.awaitingPongSince = 0;
+        this.unansweredPings = 0;
         return;
       }
       if (parsed.type === 'ping') {
@@ -182,23 +197,44 @@ export class KanbanWsClient {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this.isOpen) return;
-      if (this.peerAnswersPing && Date.now() - this.lastPongAt > this.options.heartbeatTimeoutMs) {
-        // Dead socket: close it so `onclose` schedules a reconnect.
-        this.options.onError?.('heartbeat timeout');
-        try {
-          this.socket?.close();
-        } catch {
-          /* ignore */
+      const now = Date.now();
+
+      if (this.peerAnswersPing) {
+        // The peer proved it speaks the handshake, so a ping it does not answer is evidence of a
+        // dead socket: measure the timeout from the moment the ping was *sent* (not from the last
+        // pong, which is always one whole interval old when `interval > timeout`).
+        if (this.awaitingPongSince > 0) {
+          if (now - this.awaitingPongSince > this.options.heartbeatTimeoutMs) {
+            // Close so `onclose` schedules a reconnect.
+            this.options.onError?.('heartbeat timeout');
+            try {
+              this.socket?.close();
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
+          // One ping outstanding at a time: nothing to send until it is answered.
+          return;
         }
+        this.awaitingPongSince = now;
+        this.sendRaw({ type: 'ping', ts: now });
         return;
       }
-      if (!this.peerAnswersPing && !this.warnedAboutHeartbeat) {
-        // The peer never answered a ping: it may simply not speak the handshake (the board
-        // bridge does not), so a missed pong must not kill a healthy connection.
-        this.warnedAboutHeartbeat = true;
-        this.options.onError?.('peer never answered ping; using socket close/error for liveness');
+
+      if (!this.warnedAboutHeartbeat) {
+        // The peer has not answered a ping yet: it may simply not speak the handshake (an old
+        // board bridge did not), so a missed pong must not kill a healthy connection. Keep
+        // pinging (the socket stays warm) and leave death detection to `onclose`/`onerror`.
+        // The first ping always precedes the first `pong`, so only a *second* unanswered ping is
+        // worth a warning — otherwise every healthy connect logs one.
+        this.unansweredPings += 1;
+        if (this.unansweredPings >= 2) {
+          this.warnedAboutHeartbeat = true;
+          this.options.onError?.('peer never answered ping; using socket close/error for liveness');
+        }
       }
-      this.sendRaw({ type: 'ping', ts: Date.now() });
+      this.sendRaw({ type: 'ping', ts: now });
     }, this.options.heartbeatIntervalMs);
   }
 

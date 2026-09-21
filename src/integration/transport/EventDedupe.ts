@@ -52,6 +52,21 @@ export class EventDedupe {
     return { duplicate: false, gap, outOfOrder };
   }
 
+  /**
+   * Adopts an authoritative `seq` as the gap-detection baseline — called for `board.snapshot`
+   * frames (server snapshots and the bridge `snapshot` reply).
+   *
+   * A snapshot *is* the state at that seq, so the local view is complete up to it: the next live
+   * event (`seq + 1`) is contiguous, and a snapshot that skipped seqs must not be read as a gap
+   * (that produced a second `board.snapshot.request` per connect — t_32e1770f). Only raises the
+   * baseline, so a stale/out-of-order snapshot cannot rewind it, and the id cache is kept (the
+   * events it already saw are still seen).
+   */
+  public adoptBaseline(seq: number): void {
+    if (!Number.isFinite(seq)) return;
+    this.highestSeq = this.highestSeq === null ? seq : Math.max(this.highestSeq, seq);
+  }
+
   /** Called after a snapshot resync so a stale `seq` window does not re-trigger gaps. */
   public reset(): void {
     this.seen.clear();

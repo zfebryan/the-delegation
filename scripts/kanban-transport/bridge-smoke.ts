@@ -69,14 +69,26 @@ check('config: default agent map', resolveTransportConfig({}).agentMap, { dev: 2
 check('config: env override extends/replaces the default', resolveTransportConfig({
   VITE_KANBAN_AGENT_MAP: 'dev:1,qa:2,lead:1',
 }).agentMap, { dev: 1, qa: 2, lead: 1 });
-check('config: adapter + backlog defaults', (() => {
+check('config: adapter + snapshot-resync defaults', (() => {
   const c = resolveTransportConfig({});
-  return { adapter: c.bridgeAdapter, backlog: c.backlogMode };
-})(), { adapter: 'auto', backlog: 'snapshot' });
-check('config: adapter/backlog off switches', (() => {
-  const c = resolveTransportConfig({ VITE_KANBAN_BRIDGE_ADAPTER: 'OFF', VITE_KANBAN_BACKLOG_MODE: 'ignore' });
-  return { adapter: c.bridgeAdapter, backlog: c.backlogMode };
-})(), { adapter: 'off', backlog: 'ignore' });
+  return { adapter: c.bridgeAdapter, timeout: c.snapshotReplyTimeoutMs, attempts: c.snapshotMaxAttempts };
+})(), { adapter: 'auto', timeout: 5000, attempts: 3 });
+check('config: adapter off + snapshot tuning override', (() => {
+  const c = resolveTransportConfig({
+    VITE_KANBAN_BRIDGE_ADAPTER: 'OFF',
+    VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS: '1500',
+    VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS: '5',
+  });
+  return { adapter: c.bridgeAdapter, timeout: c.snapshotReplyTimeoutMs, attempts: c.snapshotMaxAttempts };
+})(), { adapter: 'off', timeout: 1500, attempts: 5 });
+check('config: bad snapshot tuning falls back to defaults', (() => {
+  const c = resolveTransportConfig({ VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS: '0', VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS: '2.5' });
+  return { timeout: c.snapshotReplyTimeoutMs, attempts: c.snapshotMaxAttempts };
+})(), { timeout: 5000, attempts: 3 });
+check('config: retired VITE_KANBAN_BACKLOG_MODE is no longer part of the config', (() => {
+  const c = resolveTransportConfig({ VITE_KANBAN_BACKLOG_MODE: 'snapshot' });
+  return Object.prototype.hasOwnProperty.call(c, 'backlogMode');
+})(), false);
 
 check('parseAgentMap: junk entries skipped', parseAgentMap(' dev:2 , qa:3 ,broken, x:notanumber, y:-1,'), { dev: 2, qa: 3 });
 check('parseAgentMap: empty input', parseAgentMap(''), {});
@@ -179,74 +191,140 @@ check('poll_error recorded as ignored, not fatal', (() => {
 check('poll_recovered recorded as ignored', adaptBridgeFrame({ type: 'poll_recovered', seq: 12, ts: 1789966568 }, OPTIONS).reason, 'bridge_poll_recovered');
 check('keepalive is liveness only', adaptBridgeFrame({ type: 'keepalive' }, OPTIONS).kind, 'liveness');
 
-// ── backlog → board.snapshot ────────────────────────────────────────────
-const backlogFrame = {
-  type: 'backlog',
+// ── snapshot (bridge's answer to board.snapshot.request) → board.snapshot ──
+const snapshotFrame = {
+  type: 'snapshot',
   count: 4,
+  seq: 12,
+  ts: 1789966700.25,
+  initialized: true,
   poll_interval_s: 3.0,
-  events: [
-    taskAdded({ task: bridgeTask({ status: 'todo' }), to_status: 'todo', seq: 5, ts: 1789966500 }),
-    statusChanged({ task: bridgeTask({ status: 'running' }), to_status: 'running', seq: 6, ts: 1789966510 }),
-    taskAdded({ task: bridgeTask({ id: 't_5a298d2d', assignee: 'intern', status: 'ready' }), task_id: 't_5a298d2d', seq: 7, ts: 1789966520 }),
-    { type: 'task_removed', task_id: 't_old', task: bridgeTask({ id: 't_old', status: 'done' }), seq: 8, ts: 1789966530 },
+  tasks: [
+    bridgeTask({ id: 't_29bcaba1', status: 'running', assignee: 'dev' }),
+    bridgeTask({ id: 't_done', status: 'done', assignee: 'qa', title: 'Sudah selesai' }),
+    bridgeTask({ id: 't_intern', status: 'ready', assignee: 'intern' }),
+    bridgeTask({ id: 't_weird', status: 'archived', assignee: 'dev' }),
   ],
 };
 
-check('backlog → one board.snapshot (last state wins, unmapped dropped, removed dropped)', (() => {
-  const f = adaptBridgeFrame(backlogFrame, OPTIONS);
+check('isBridgeFrame: snapshot frame is a bridge frame', isBridgeFrame(snapshotFrame), true);
+
+check('snapshot → one board.snapshot from the poller state (unmapped/unknown dropped + NACK)', (() => {
+  const f = adaptBridgeFrame(snapshotFrame, OPTIONS);
   const e = f.envelopes[0];
   return {
-    kind: f.kind, envelopes: f.envelopes.length, type: e.type, seq: e.seq, id: e.id, payload: e.payload,
+    kind: f.kind, envelopes: f.envelopes.length, type: e.type, seq: e.seq, id: e.id, ts: e.ts,
+    baselineSeq: f.baselineSeq, payload: e.payload,
     nacks: f.nacks.map((n) => `${n.reason}:${n.taskId}`),
   };
 })(), {
-  kind: 'envelopes', envelopes: 1, type: 'board.snapshot', seq: 8, id: 'bridge:backlog:8',
+  kind: 'envelopes', envelopes: 1, type: 'board.snapshot', seq: 12, id: 'bridge:snapshot:12:1789966700250',
+  ts: 1789966700250, baselineSeq: 12,
   payload: {
-    tasks: [{
-      id: 't_29bcaba1', title: 'Bridge WebSocket untuk event kanban', description: '', assignedAgentId: 2,
-      status: 'in_progress', requiresUserApproval: false, createdAt: 1789965828500,
-    }],
+    tasks: [
+      {
+        id: 't_29bcaba1', title: 'Bridge WebSocket untuk event kanban', description: '',
+        assignedAgentId: 2, status: 'in_progress', requiresUserApproval: false, createdAt: 1789965828500,
+      },
+      {
+        id: 't_done', title: 'Sudah selesai', description: '', assignedAgentId: 3, status: 'done',
+        requiresUserApproval: false, createdAt: 1789965828500,
+      },
+    ],
     phase: 'working',
   },
-  nacks: ['unknown_assignee:t_5a298d2d'],
+  nacks: ['unknown_assignee:t_intern', 'unknown_status:t_weird'],
 });
 
-check('backlog: all-done board reports phase done', (() => {
+check('snapshot: initialized=false is NOT applied (no baseline ≠ empty board)', (() => {
+  const f = adaptBridgeFrame({ type: 'snapshot', count: 0, seq: 4, ts: 1789966500, initialized: false, tasks: [] }, OPTIONS);
+  return { kind: f.kind, reason: f.reason, envelopes: f.envelopes.length, nacks: f.nacks, baselineSeq: f.baselineSeq };
+})(), { kind: 'ignored', reason: 'snapshot_not_initialized', envelopes: 0, nacks: [], baselineSeq: 4 });
+
+check('snapshot: initialized=true with tasks: [] is a legitimately empty board', (() => {
+  const f = adaptBridgeFrame({ type: 'snapshot', count: 0, seq: 5, ts: 1789966500, initialized: true, tasks: [] }, OPTIONS);
+  return { kind: f.kind, payload: f.envelopes[0].payload, id: f.envelopes[0].id };
+})(), { kind: 'envelopes', payload: { tasks: [], phase: 'idle' }, id: 'bridge:snapshot:5:1789966500000' });
+
+check('snapshot: missing tasks is not applied (partial snapshot never wipes the board)', (() => {
+  const f = adaptBridgeFrame({ type: 'snapshot', count: 2, seq: 6, ts: 1789966500, initialized: true }, OPTIONS);
+  return { kind: f.kind, reason: f.reason, envelopes: f.envelopes.length };
+})(), { kind: 'ignored', reason: 'snapshot_missing_tasks', envelopes: 0 });
+
+check('snapshot: all-done board reports phase done', (() => {
   const f = adaptBridgeFrame({
-    type: 'backlog', events: [statusChanged({ to_status: 'done', task: bridgeTask({ status: 'done' }) })],
+    type: 'snapshot', seq: 7, ts: 1789966500, initialized: true,
+    tasks: [bridgeTask({ id: 't_done', status: 'done', assignee: 'dev' })],
   }, OPTIONS);
   return f.envelopes[0].payload.phase;
 })(), 'done');
 
-check('backlog: empty board reports phase idle', adaptBridgeFrame({ type: 'backlog', events: [] }, OPTIONS).envelopes[0].payload.phase, 'idle');
-check('backlog: ignore mode drops the frame', (() => {
-  const f = adaptBridgeFrame(backlogFrame, { ...OPTIONS, backlogMode: 'ignore' });
-  return { kind: f.kind, reason: f.reason, envelopes: f.envelopes.length };
-})(), { kind: 'ignored', reason: 'backlog_ignored', envelopes: 0 });
-
-// ── dedupe/id synthesis ─────────────────────────────────────────────────
-check('dedupe: replayed backlog frame is a duplicate (stable id)', (() => {
+check('snapshot: id is stable, so a replayed frame is a duplicate', (() => {
   const dedupe = new EventDedupe(10);
-  const first = adaptBridgeFrame(backlogFrame, OPTIONS).envelopes[0];
-  const second = adaptBridgeFrame(backlogFrame, OPTIONS).envelopes[0];
+  const first = adaptBridgeFrame(snapshotFrame, OPTIONS).envelopes[0];
+  const second = adaptBridgeFrame(snapshotFrame, OPTIONS).envelopes[0];
   return [dedupe.check(first), dedupe.check(second)];
 })(), [
   { duplicate: false, gap: false, outOfOrder: false },
   { duplicate: true, gap: false, outOfOrder: false },
 ]);
 
-check('dedupe: backlog seq baseline keeps the first live event contiguous', (() => {
+check('snapshot: two replies with the same seq but different ts are both applied', (() => {
+  // The bridge does not consume a seq for its own snapshot, so a request and its retry can answer
+  // with the same seq; the retry must not be dropped as a duplicate of the first.
   const dedupe = new EventDedupe(10);
-  dedupe.check(adaptBridgeFrame(backlogFrame, OPTIONS).envelopes[0]);   // seq 8
-  const live = adaptBridgeFrame(statusChanged({ seq: 9 }), OPTIONS).envelopes[0];
-  return dedupe.check(live);
-})(), { duplicate: false, gap: false, outOfOrder: false });
+  const first = adaptBridgeFrame(snapshotFrame, OPTIONS).envelopes[0];
+  const retried = adaptBridgeFrame({ ...snapshotFrame, ts: 1789966799.75 }, OPTIONS).envelopes[0];
+  return { ids: [first.id, retried.id], verdicts: [dedupe.check(first), dedupe.check(retried)] };
+})(), {
+  ids: ['bridge:snapshot:12:1789966700250', 'bridge:snapshot:12:1789966799750'],
+  verdicts: [
+    { duplicate: false, gap: false, outOfOrder: false },
+    { duplicate: false, gap: false, outOfOrder: false },
+  ],
+});
 
+// ── backlog is retired as a board source ────────────────────────────────
+const backlogFrame = {
+  type: 'backlog',
+  count: 2,
+  poll_interval_s: 3.0,
+  events: [
+    taskAdded({ task: bridgeTask({ status: 'todo' }), to_status: 'todo', seq: 5, ts: 1789966500 }),
+    statusChanged({ task: bridgeTask({ status: 'running' }), to_status: 'running', seq: 6, ts: 1789966510 }),
+  ],
+};
+
+check('backlog is retired: known frame, no envelope, no NACK', (() => {
+  const f = adaptBridgeFrame(backlogFrame, OPTIONS);
+  return { kind: f.kind, reason: f.reason, envelopes: f.envelopes.length, nacks: f.nacks, baselineSeq: f.baselineSeq };
+})(), { kind: 'ignored', reason: 'backlog_superseded', envelopes: 0, nacks: [], baselineSeq: undefined });
+
+// ── dedupe/id synthesis and the snapshot seq baseline ───────────────────
 check('dedupe: a skipped seq is flagged as a gap', (() => {
   const dedupe = new EventDedupe(10);
-  dedupe.check(adaptBridgeFrame(backlogFrame, OPTIONS).envelopes[0]);   // seq 8
+  dedupe.check({ id: 'bridge:5', seq: 5 });
   return dedupe.check(adaptBridgeFrame(statusChanged({ seq: 11 }), OPTIONS).envelopes[0]);
 })(), { duplicate: false, gap: true, outOfOrder: false });
+
+check('dedupe: adoptBaseline makes the snapshot seq itself contiguous (no false gap)', (() => {
+  const dedupe = new EventDedupe(10);
+  dedupe.check({ id: 'bridge:5', seq: 5 });
+  dedupe.adoptBaseline(12);   // snapshot answered our request
+  const snapshot = adaptBridgeFrame(snapshotFrame, OPTIONS).envelopes[0];
+  return { snapshot: dedupe.check(snapshot), live: dedupe.check({ id: 'bridge:13', seq: 13 }) };
+})(), {
+  snapshot: { duplicate: false, gap: false, outOfOrder: false },
+  live: { duplicate: false, gap: false, outOfOrder: false },
+});
+
+check('dedupe: adoptBaseline never rewinds (stale snapshot stays out of order)', (() => {
+  const dedupe = new EventDedupe(10);
+  dedupe.check({ id: 'bridge:9', seq: 9 });
+  dedupe.adoptBaseline(4);
+  const verdict = dedupe.check({ id: 'bridge:10', seq: 10 });
+  return { lastSequence: dedupe.lastSequence, verdict };
+})(), { lastSequence: 10, verdict: { duplicate: false, gap: false, outOfOrder: false } });
 
 // ── end to end: real bridge frame → mapper → store actions ──────────────
 const makeDeps = (initialTasks: { id: string; status: string; assignedAgentId: number }[] = [{ id: 't_other', status: 'scheduled', assignedAgentId: 2 }]) => {
@@ -308,10 +386,24 @@ check('E2E status_changed reopening a finished task uses reopenTask', (() => {
   return { results, calls };
 })(), { results: [{ status: 'applied' }], calls: ['reopenTask:t_29bcaba1:in_progress'] });
 
-check('E2E backlog → applied board.snapshot', (() => {
-  const { results, calls } = runFrame(backlogFrame);
-  return { results, calls };
-})(), { results: [{ status: 'applied' }], calls: ['applySnapshot:t_29bcaba1/in_progress/2:working'] });
+check('E2E snapshot → applied board.snapshot (from poller state)', (() => {
+  const { frame, results, calls } = runFrame(snapshotFrame);
+  return { results, calls, nacks: frame.nacks.map((n) => n.reason) };
+})(), {
+  results: [{ status: 'applied' }],
+  calls: ['applySnapshot:t_29bcaba1/in_progress/2,t_done/done/3:working'],
+  nacks: ['unknown_assignee', 'unknown_status'],
+});
+
+check('E2E snapshot with initialized=false never reaches the mapper', (() => {
+  const { frame, results, calls } = runFrame({ type: 'snapshot', seq: 4, initialized: false, tasks: [] });
+  return { kind: frame.kind, reason: frame.reason, results, calls };
+})(), { kind: 'ignored', reason: 'snapshot_not_initialized', results: [], calls: [] });
+
+check('E2E retired backlog never reaches the mapper', (() => {
+  const { frame, results, calls } = runFrame(backlogFrame);
+  return { kind: frame.kind, reason: frame.reason, results, calls };
+})(), { kind: 'ignored', reason: 'backlog_superseded', results: [], calls: [] });
 
 check('E2E unmapped assignee never reaches the mapper', (() => {
   const { frame, results, calls } = runFrame(taskAdded({ task: bridgeTask({ assignee: 'intern' }) }));

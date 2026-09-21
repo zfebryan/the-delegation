@@ -18,6 +18,11 @@ const asPositiveNumber = (raw: unknown, fallback: number): number => {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 };
 
+const asPositiveInteger = (raw: unknown, fallback: number): number => {
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+};
+
 /**
  * Vite inlines `import.meta.env.<NAME>` statically, so the reads below must be explicit
  * property accesses (a destructured/dynamic lookup would ship `import.meta.env` unresolved).
@@ -30,9 +35,10 @@ const readBuildEnv = (): Record<string, unknown> => ({
   VITE_KANBAN_WS_HEARTBEAT_MS: import.meta.env.VITE_KANBAN_WS_HEARTBEAT_MS,
   VITE_KANBAN_WS_HEARTBEAT_TIMEOUT_MS: import.meta.env.VITE_KANBAN_WS_HEARTBEAT_TIMEOUT_MS,
   VITE_KANBAN_WS_DEDUPE_SIZE: import.meta.env.VITE_KANBAN_WS_DEDUPE_SIZE,
+  VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS: import.meta.env.VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS,
+  VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS: import.meta.env.VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS,
   VITE_KANBAN_AGENT_MAP: import.meta.env.VITE_KANBAN_AGENT_MAP,
   VITE_KANBAN_BRIDGE_ADAPTER: import.meta.env.VITE_KANBAN_BRIDGE_ADAPTER,
-  VITE_KANBAN_BACKLOG_MODE: import.meta.env.VITE_KANBAN_BACKLOG_MODE,
 });
 
 export function resolveTransportConfig(
@@ -59,7 +65,11 @@ export function resolveTransportConfig(
     // `kanban-ws-bridge` speaks its own flat frame format; the adapter is what makes those
     // frames land in the §6.2 envelope. `off` keeps the raw §6.2 path for a future server.
     bridgeAdapter: String(env.VITE_KANBAN_BRIDGE_ADAPTER ?? '').trim().toLowerCase() === 'off' ? 'off' : 'auto',
-    backlogMode: String(env.VITE_KANBAN_BACKLOG_MODE ?? '').trim().toLowerCase() === 'ignore' ? 'ignore' : 'snapshot',
+    // The bridge answers `board.snapshot.request` with `snapshot` (PR #12), so a resync no longer
+    // has to trust "the socket was open": wait for the reply, retry a bounded number of times,
+    // then report it as unanswered.
+    snapshotReplyTimeoutMs: asPositiveNumber(env.VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS, 5000),
+    snapshotMaxAttempts: asPositiveInteger(env.VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS, 3),
     // Explicit table beats guessing: see BridgeAdapter header + docs §7.
     agentMap: { ...DEFAULT_AGENT_MAP, ...parseAgentMap(env.VITE_KANBAN_AGENT_MAP as string) },
   };

@@ -48,6 +48,27 @@ check('dedupe: older seq ⇒ out of order', dedupe.check({ id: 'c', seq: 2 }), {
 dedupe.reset();
 check('dedupe: reset clears seq window', dedupe.check({ id: 'a', seq: 1 }), { duplicate: false, gap: false, outOfOrder: false });
 
+check('dedupe: adoptBaseline makes a jumped snapshot seq contiguous (no false gap)', (() => {
+  const d = new EventDedupe(10);
+  d.check({ id: 'e5', seq: 5 });
+  d.adoptBaseline(9);   // a board.snapshot / bridge `snapshot` reply at seq 9
+  return { snapshot: d.check({ id: 'e9', seq: 9 }), live: d.check({ id: 'e10', seq: 10 }) };
+})(), {
+  snapshot: { duplicate: false, gap: false, outOfOrder: false },
+  live: { duplicate: false, gap: false, outOfOrder: false },
+});
+
+check('dedupe: adoptBaseline only raises the baseline', (() => {
+  const d = new EventDedupe(10);
+  d.check({ id: 'e9', seq: 9 });
+  d.adoptBaseline(3);
+  return d.lastSequence;
+})(), 9);
+
+check('config: VITE_KANBAN_BACKLOG_MODE is retired', Object.prototype.hasOwnProperty.call(
+  resolveTransportConfig({ VITE_KANBAN_BACKLOG_MODE: 'snapshot' }), 'backlogMode',
+), false);
+
 // ── mapper against fake stores ───────────────────────────────────────────
 const makeDeps = () => {
   const calls: string[] = [];

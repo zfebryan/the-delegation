@@ -41,8 +41,15 @@ export interface TransportConfig {
   dedupeCacheSize: number;
   /** `auto`: route `kanban-ws-bridge` frames through the adapter; `off`: §6.2 envelopes only. */
   bridgeAdapter: 'auto' | 'off';
-  /** What to do with the bridge `backlog` frame: summarize into `board.snapshot`, or ignore. */
-  backlogMode: 'snapshot' | 'ignore';
+  /**
+   * How long to wait for the answer to a `board.snapshot.request` before re-sending it, and how
+   * many attempts a single resync may make before it is reported as unanswered. The bridge
+   * replies with `snapshot` (`ping` → `pong` are the liveness counterpart), so a request that is
+   * never answered is evidence the peer does not speak this protocol — historically the case,
+   * when the backlog was the only bootstrap.
+   */
+  snapshotReplyTimeoutMs: number;
+  snapshotMaxAttempts: number;
   /** `assignee` (Hermes profile name) → `agentIndex` (0=user, 1=lead, 2..4=subagent). */
   agentMap: Record<string, number>;
 }

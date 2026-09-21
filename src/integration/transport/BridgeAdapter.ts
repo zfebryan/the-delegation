@@ -6,7 +6,8 @@ import type { RemoteTaskStatus } from './KanbanEventMapper';
  *
  * The bridge in `criminals-sandbox` (`kanban-ws-bridge`, FastAPI) publishes *flat* frames
  * (`task_added`, `status_changed`, `task_updated`, `task_removed`, `backlog`, `poll_error`,
- * `keepalive`), while `KanbanEventMapper` consumes the §6.2 envelope
+ * `keepalive`, and — since PR #12 — `snapshot` as the answer to `board.snapshot.request`),
+ * while `KanbanEventMapper` consumes the §6.2 envelope
  * (`{v,id,type,seq,ts,projectId,agentIndex,taskId,payload}`). This module is the pure,
  * side-effect-free translation between the two, so it can be unit-tested without a socket.
  *
@@ -22,10 +23,17 @@ import type { RemoteTaskStatus } from './KanbanEventMapper';
  *   to the wrong desk). `on_hold` deliberately carries both "needs human review" and
  *   "in the boardroom" (§7.8).
  * - `id` is synthesized from the per-event `seq` the bridge does send
- *   (`bridge:<seq>`, verified live — only the `backlog` *wrapper* lacks `seq`), so dedupe and
- *   `seq` gap detection stay enabled.
- * - `backlog` is summarized into one `board.snapshot` (last state per `task_id`), because the
- *   bridge has no snapshot endpoint; `VITE_KANBAN_BACKLOG_MODE=ignore` disables that.
+ *   (`bridge:<seq>`, plus `bridge:snapshot:<seq>` for the snapshot frame so it cannot collide
+ *   with an event), so dedupe and `seq` gap detection stay enabled.
+ * - `snapshot` (the bridge's answer to `board.snapshot.request`) becomes a `board.snapshot`
+ *   built from the poller's `_state`: a **full** board, not a window over the event ring
+ *   buffer. `initialized: false` means the poller has no baseline yet and is **not** applied
+ *   (the last column of a real board must never be wiped by "not polled yet"); the frame still
+ *   reports its `seq` as `baselineSeq` so gap detection is rebased on it.
+ * - `backlog` is **retired** as a board source: its events are a bounded window, so the task
+ *   list it produces is partial, and applying it as `board.snapshot` could delete local tasks
+ *   that happen to have no event left in the buffer (same failure class as `t_4002d267`).
+ *   The authoritative `snapshot` reply replaces it (§7.4).
  * - `task_updated` / `task_removed` are **not** mapped: §6.2 has no `task.updated`/`task.removed`
  *   event and the local `removeTask` pushes `phase → done` as a side effect (research §7.3).
  *   They are dropped with a NACK so the gap is visible rather than silent.
@@ -37,6 +45,7 @@ export const BRIDGE_EVENT_TYPES = [
   'task_updated',
   'task_removed',
   'backlog',
+  'snapshot',
   'poll_error',
   'poll_recovered',
   'keepalive',
@@ -50,8 +59,6 @@ export type BridgeEventType = (typeof BRIDGE_EVENT_TYPES)[number];
  * `VITE_KANBAN_AGENT_MAP=name:index,...` when the active team differs.
  */
 export const DEFAULT_AGENT_MAP: Record<string, number> = { dev: 2, qa: 3 };
-
-export type BacklogMode = 'snapshot' | 'ignore';
 
 /** Hermes kanban status → §6.2 `TaskStatus`. */
 const STATUS_FROM_BRIDGE: Record<string, RemoteTaskStatus> = {
@@ -108,6 +115,14 @@ export interface AdaptedFrame {
   nacks: NackFrame[];
   /** Machine-readable note for `ignored` frames (e.g. `bridge_poll_error`). */
   reason?: string;
+  /**
+   * The bridge's own `seq` counter as reported by this frame (bridge `snapshot` frames).
+   * A snapshot is authoritative *at* that seq, so the transport adopts it as the gap-detection
+   * baseline — including when the frame carries no usable tasks (`initialized: false`), where
+   * not adopting it would make the next live event look like a gap and trigger a second
+   * `board.snapshot.request` per connect (measured: `review-a/trace-out.txt`, card t_32e1770f).
+   */
+  baselineSeq?: number;
 }
 
 export interface BridgeAdapterOptions {
@@ -115,7 +130,6 @@ export interface BridgeAdapterOptions {
   agentMap?: Record<string, number>;
   /** Agent indexes that exist in the active team; mapped indexes outside it are NACKed. */
   validAgentIndices?: number[];
-  backlogMode?: BacklogMode;
   projectId?: string;
   /** Injectable clock (ms) so envelopes stay deterministic in tests. */
   now?: () => number;
@@ -214,27 +228,54 @@ function toRemoteTask(
   };
 }
 
-/** Last-known state of every task mentioned by a `backlog` frame. */
-function collectBacklogTasks(events: unknown[]): Record<string, any>[] {
-  const byId = new Map<string, { task: Record<string, any>; removed: boolean }>();
-  events.forEach((raw) => {
-    const event = asRecord(raw);
-    if (!event) return;
-    const rawTask = asRecord(event.task);
-    const taskId = asNonEmptyString(rawTask?.id) ?? asNonEmptyString(event.task_id);
-    if (!taskId) return;
-    const task = rawTask ?? { id: taskId, title: event.title, status: event.to_status };
-    byId.set(taskId, { task: { ...task, id: taskId }, removed: event.type === 'task_removed' });
-  });
-  return [...byId.values()].filter((entry) => !entry.removed).map((entry) => entry.task);
-}
-
 /** Board phase derived from the translated task statuses (no bridge field carries it). */
 function derivePhase(statuses: RemoteTaskStatus[]): 'idle' | 'working' | 'done' {
   if (statuses.length === 0) return 'idle';
   if (statuses.every((status) => status === 'done')) return 'done';
   if (statuses.some((status) => status === 'in_progress' || status === 'on_hold')) return 'working';
   return 'idle';
+}
+
+/**
+ * Translates a bridge task list (the `snapshot` frame's `tasks`, same `summarize()` shape as the
+ * `task` field of an event) into §6.2 task inputs. Tasks whose owner is unmapped / outside the
+ * active team, or whose status is unknown, are **dropped with a NACK** instead of being applied
+ * with a guessed desk — the same rule as the per-event path (docs §7.1, §7.2).
+ */
+function translateTaskList(
+  tasks: unknown[],
+  agentMap: Record<string, number>,
+  validAgentIndices: number[],
+  bridgeType: string,
+): { translated: { taskId: string; task: Record<string, any>; status: RemoteTaskStatus }[]; nacks: NackFrame[] } {
+  const nacks: NackFrame[] = [];
+  const translated: { taskId: string; task: Record<string, any>; status: RemoteTaskStatus }[] = [];
+
+  tasks.forEach((rawTask) => {
+    const bridgeTask = asRecord(rawTask);
+    if (!bridgeTask) return;
+    const taskId = asNonEmptyString(bridgeTask.id);
+    if (!taskId) return;
+    const agent = resolveAgent(bridgeTask.assignee, agentMap, validAgentIndices);
+    if (agent.nack || agent.index === undefined) {
+      nacks.push({
+        type: 'event.nack',
+        reason: agent.nack ?? 'unknown_assignee',
+        bridgeType,
+        taskId,
+        assignee: asNonEmptyString(bridgeTask.assignee) ?? undefined,
+      });
+      return;
+    }
+    const status = bridgeToTaskStatus(bridgeTask.status);
+    if (!status) {
+      nacks.push({ type: 'event.nack', reason: 'unknown_status', bridgeType, taskId });
+      return;
+    }
+    translated.push({ taskId, task: toRemoteTask(bridgeTask, agent.index, taskId), status });
+  });
+
+  return { translated, nacks };
 }
 
 let synthesizedIdCounter = 0;
@@ -428,55 +469,63 @@ export function adaptBridgeFrame(raw: unknown, options: BridgeAdapterOptions = {
       };
     }
 
-    case 'backlog': {
-      if ((options.backlogMode ?? 'snapshot') === 'ignore') {
-        return { kind: 'ignored', bridgeType: type, envelopes: [], nacks: [], reason: 'backlog_ignored' };
+    // Retired as a board source: the bridge now answers `board.snapshot.request` with `snapshot`
+    // built from the poller state, while the backlog is a bounded window over the event ring
+    // buffer — applying it would delete local tasks whose events already left the buffer
+    // (docs §7.4). Known frame, no store effect, no NACK (nothing is divergent).
+    case 'backlog':
+      return { kind: 'ignored', bridgeType: type, envelopes: [], nacks: [], reason: 'backlog_superseded' };
+
+    // Resync answer to `board.snapshot.request`: the poller's current task state (`_state`),
+    // independent of `EVENT_BUFFER_SIZE`.
+    case 'snapshot': {
+      const baselineSeq = seq ?? undefined;
+
+      if (frame.initialized === false) {
+        // The poller has not produced a baseline yet: an empty/short `tasks` list means
+        // "unknown", not "empty board". Applying it would wipe a real local board, which is the
+        // failure mode fixed for `board.snapshot` without `tasks` (t_4002d267). The `seq` is
+        // still adopted so the first live event after the baseline is not read as a gap.
+        return {
+          kind: 'ignored',
+          bridgeType: type,
+          envelopes: [],
+          nacks: [],
+          reason: 'snapshot_not_initialized',
+          baselineSeq,
+        };
       }
 
-      const events = Array.isArray(frame.events) ? frame.events : [];
-      const nacks: NackFrame[] = [];
-      const translated: { taskId: string; task: Record<string, any>; status: RemoteTaskStatus }[] = [];
+      if (!Array.isArray(frame.tasks)) {
+        // Defensive twin of the mapper's `missing_tasks` guard: a frame we cannot read in full
+        // must never replace the board.
+        return {
+          kind: 'ignored',
+          bridgeType: type,
+          envelopes: [],
+          nacks: [],
+          reason: 'snapshot_missing_tasks',
+          baselineSeq,
+        };
+      }
 
-      collectBacklogTasks(events).forEach((bridgeTask) => {
-        const taskId = asNonEmptyString(bridgeTask.id);
-        if (!taskId) return;
-        const agent = resolveAgent(bridgeTask.assignee, agentMap, validAgentIndices);
-        if (agent.nack || agent.index === undefined) {
-          nacks.push({
-            type: 'event.nack',
-            reason: agent.nack ?? 'unknown_assignee',
-            bridgeType: type,
-            taskId,
-            assignee: asNonEmptyString(bridgeTask.assignee) ?? undefined,
-          });
-          return;
-        }
-        const status = bridgeToTaskStatus(bridgeTask.status);
-        if (!status) {
-          nacks.push({ type: 'event.nack', reason: 'unknown_status', bridgeType: type, taskId });
-          return;
-        }
-        translated.push({ taskId, task: toRemoteTask(bridgeTask, agent.index, taskId), status });
-      });
-
-      // Baseline for gap detection: the highest `seq` replayed, so the first live event after
-      // the backlog is contiguous instead of being mistaken for a fresh baseline.
-      const maxSeq = events.reduce<number | null>((max, raw) => {
-        const inner = asFiniteNumber(asRecord(raw)?.seq);
-        if (inner === null) return max;
-        return max === null || inner > max ? inner : max;
-      }, null);
-
-      const id = maxSeq !== null ? `bridge:backlog:${maxSeq}` : envelopeId(null, 'backlog', null, ts);
+      const { translated, nacks } = translateTaskList(frame.tasks, agentMap, validAgentIndices, type);
       return {
         kind: 'envelopes',
         bridgeType: type,
+        baselineSeq,
         envelopes: [
           {
             v: 1,
-            id,
+            // `seq` alone is not unique per reply: the bridge's snapshot does not consume its own
+            // seq, so two resyncs with no event in between (a request plus its retry) arrive with
+            // the same `seq`. `ts` (reply time, ms) makes the id stable for a repeated *frame* but
+            // distinct across replies, so a retried resync is never dropped as a duplicate.
+            id: seq !== null && ts !== undefined
+              ? `bridge:snapshot:${seq}:${ts}`
+              : envelopeId(seq, 'snapshot', null, ts),
             type: 'board.snapshot',
-            seq: maxSeq ?? undefined,
+            seq: seq ?? undefined,
             ts,
             projectId,
             payload: {

@@ -17,7 +17,10 @@ export default defineConfig(({mode}) => {
       'import.meta.env.VITE_KANBAN_TRANSPORT_MODE': JSON.stringify(env.VITE_KANBAN_TRANSPORT_MODE ?? env.KANBAN_TRANSPORT_MODE ?? ''),
       'import.meta.env.VITE_KANBAN_AGENT_MAP': JSON.stringify(env.VITE_KANBAN_AGENT_MAP ?? env.KANBAN_AGENT_MAP ?? ''),
       'import.meta.env.VITE_KANBAN_BRIDGE_ADAPTER': JSON.stringify(env.VITE_KANBAN_BRIDGE_ADAPTER ?? env.KANBAN_BRIDGE_ADAPTER ?? ''),
-      'import.meta.env.VITE_KANBAN_BACKLOG_MODE': JSON.stringify(env.VITE_KANBAN_BACKLOG_MODE ?? env.KANBAN_BACKLOG_MODE ?? ''),
+      // Resync budget: how long a `board.snapshot.request` waits for the bridge `snapshot` reply,
+      // and how many attempts one resync may make (see BridgeAdapter/KanbanTransport §7.8).
+      'import.meta.env.VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS': JSON.stringify(env.VITE_KANBAN_WS_SNAPSHOT_TIMEOUT_MS ?? env.KANBAN_WS_SNAPSHOT_TIMEOUT_MS ?? ''),
+      'import.meta.env.VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS': JSON.stringify(env.VITE_KANBAN_WS_SNAPSHOT_ATTEMPTS ?? env.KANBAN_WS_SNAPSHOT_ATTEMPTS ?? ''),
     },
     resolve: {
       alias: {
