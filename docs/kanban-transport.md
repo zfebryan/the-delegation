@@ -79,8 +79,15 @@ dokumen riset.
 
 Alasannya konkret: bridge `kanban-ws-bridge` tidak membalas `ping` (loop-nya hanya
 `receive_text()`), sehingga socket yang sehat akan ditutup paksa tiap siklus heartbeat dan
-selalu memicu `board.snapshot.request` baru. Perilaku ini terukur sebelum perbaikan:
-6 reconnect dalam 8 detik terhadap bridge di `ws://127.0.0.1:8000/ws`.
+selalu memicu `board.snapshot.request` baru.
+
+Terukur ulang pada bridge nyata di `ws://127.0.0.1:8000/ws` (Node 26, ping 1s, timeout 800ms,
+reconnect 300ms, 8 detik): aturan lama → **6 close paksa / 6 reconnect**; aturan sekarang →
+**0 close paksa** (socket tetap `online`). Reproduksi tanpa menyentuh kode app:
+
+```bash
+node scripts/kanban-transport/old-rule-probe.mjs ws://127.0.0.1:8000/ws
+```
 
 ## 6. Verifikasi (tanpa `npm run build`/`tsc` di lingkungan ini)
 
@@ -99,13 +106,16 @@ verifikasi dilakukan dengan membaca ulang kode + harness Node yang dibundel `esb
 ./node_modules/.bin/esbuild scripts/kanban-transport/heartbeat.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-hb.mjs && node /tmp/kb-hb.mjs
 ```
 
-Ketiga harness di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut menambah
-diagnostik ke `npm run lint`, dan tidak menarik dependensi baru (`esbuild` ikut bersama vite).
+Ketiga harness TypeScript di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut
+menambah diagnostik ke `npm run lint`, dan tidak menarik dependensi baru (`esbuild` ikut bersama
+vite). `old-rule-probe.mjs` (JS murni, `node` langsung) hanya untuk mereproduksi aturan liveness
+lama; lihat §5.
 
 Hasil terakhir (host 4 GB, bridge hidup di `ws://127.0.0.1:8000/ws`): harness (1)
-`ALL CHECKS PASSED`; (2) `states: [connecting, online]`, 0 reconnect, 1 event `backlog` masuk;
-(3) peer diam → tetap `online` tanpa close paksa, peer yang menjawab `pong` lalu diam →
-`heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
+`ALL CHECKS PASSED`; (2) states `["connecting","online","err:peer never answered ping; …","offline"]`
+(`offline` terakhir karena `dispose()` di akhir skrip), 0 reconnect, 1 event `backlog` masuk yang
+dihitung `ignored:unknown_type`; (3) peer diam → tetap `online` tanpa close paksa, peer yang
+menjawab `pong` lalu diam → `heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
 
 Sebelum merge, jalankan `npm ci && npm run lint && npm run build` di mesin yang punya RAM cukup:
 
