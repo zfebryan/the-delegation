@@ -106,7 +106,7 @@ verifikasi dilakukan dengan membaca ulang kode + harness Node yang dibundel `esb
 # 1) config + dedupe + mapper murni, store palsu (29 assertion)
 ./node_modules/.bin/esbuild scripts/kanban-transport/smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-smoke.mjs && node /tmp/kb-smoke.mjs
 
-# 2) adapter bridge → §6.2: pemetaan assignee/status, backlog, NACK, dedupe (36 assertion)
+# 2) adapter bridge → §6.2: pemetaan assignee/status, backlog, NACK, dedupe (38 assertion)
 ./node_modules/.bin/esbuild scripts/kanban-transport/bridge-smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-bridge.mjs && node /tmp/kb-bridge.mjs
 
 # 3) klien nyata terhadap bridge nyata melalui adapter (butuh bridge jalan di :8000)
@@ -122,10 +122,11 @@ vite). `old-rule-probe.mjs` (JS murni, `node` langsung) hanya untuk mereproduksi
 lama; lihat §5.
 
 Hasil terakhir (host 4 GB, bridge hidup di `ws://127.0.0.1:8000/ws`): harness (1)
-`ALL CHECKS PASSED` (29 assertion); (2) `ALL CHECKS PASSED` (36 assertion, adapter); (3) lihat
-§7.6 — frame `backlog` nyata jadi `applied:board.snapshot`, event di dalamnya (`task_added`,
-`status_changed`) jadi `applied:task.created` / `applied:task.status_changed`, 0 reconnect;
-(4) peer diam → tetap `online` tanpa close paksa, peer yang menjawab `pong` lalu diam →
+`ALL CHECKS PASSED` (29 assertion); (2) `ALL CHECKS PASSED` (38 assertion, adapter); (3) lihat
+§7.6 — frame `backlog` nyata jadi `applied:board.snapshot`, 2 frame `status_changed` yang datang
+**live** jadi `applied:task.status_changed`, dan event di dalam backlog (`task_added`,
+`status_changed`) jadi `applied:task.created` / `applied:task.status_changed` saat di-replay,
+0 reconnect; (4) peer diam → tetap `online` tanpa close paksa, peer yang menjawab `pong` lalu diam →
 `heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
 
 Sebelum merge, jalankan `npm ci && npm run lint && npm run build` di mesin yang punya RAM cukup:
@@ -210,13 +211,15 @@ pertama terhitung contiguous (bukan baseline baru). Bisa dimatikan dengan
   Perbaikan sisi bridge sudah jadi kartu lanjutan `t_e5fc6584`.
 
 ### 7.6 Verifikasi adapter (hasil nyata)
-- `scripts/kanban-transport/bridge-smoke.ts` → `ALL CHECKS PASSED` (36 assertion): tabel
+- `scripts/kanban-transport/bridge-smoke.ts` → `ALL CHECKS PASSED` (38 assertion): tabel
   `assignee`, tabel status dua arah, `task_added`→`task.created`, `status_changed`→
   `task.status_changed`, `blocked`→`on_hold`, NACK untuk `unknown_assignee` /
   `agent_not_in_team` / `unknown_status` / malformed, `task_updated`/`task_removed` ditolak
   eksplisit, `poll_error`/`keepalive`, rangkuman `backlog` (termasuk `phase` dan baseline `seq`),
   dedupe + gap, dan jalur ujung-ke-ujung adapter → mapper (store calls nyata).
 - `scripts/kanban-transport/live.ts` terhadap bridge nyata: 0 reconnect, frame `backlog` →
-  `applied:board.snapshot`; event di dalam backlog (payload nyata dari bridge) di-replay lewat
-  adapter yang sama → `applied:task.created` + `applied:task.status_changed` (dengan store task
-  in-memory, bukan lagi `ignored:unknown_type`).
+  `applied:board.snapshot`, 2 frame `status_changed` yang tiba **live** setelah backlog →
+  `applied:task.status_changed`; event di dalam backlog (payload nyata dari bridge) di-replay
+  lewat adapter yang sama → `applied:task.created` ×4 + `applied:task.status_changed` ×4 dengan
+  store task in-memory (bukan lagi `ignored:unknown_type`). Satu `ignored:unknown_task` memang
+  benar: kartu `t_8b8a8054` dibuat sebelum buffer bridge dimulai, jadi `task_added`-nya tidak ada.
