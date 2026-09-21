@@ -162,7 +162,11 @@ export function mapKanbanEvent(event: KanbanEventEnvelope, deps: MapperDeps): Ma
 
     // ── Board ────────────────────────────────────────────────────
     case 'board.snapshot': {
-      const rawTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+      // `board.snapshot` is the resync path (reconnect, `seq` gap, team switch). A payload
+      // without `tasks` is a partial/foreign-version event: defaulting to `[]` would wipe every
+      // local task. Only an explicit `tasks: []` may replace the board with an empty one.
+      if (!Array.isArray(payload.tasks)) return { status: 'rejected', reason: 'missing_tasks' };
+      const rawTasks: unknown[] = payload.tasks;
       const tasks = rawTasks
         .map((t) => normalizeTask(t, validAgentIndices))
         .filter((t): t is NonNullable<ReturnType<typeof normalizeTask>> & { id: string } => !!t && !!t.id);
@@ -259,6 +263,13 @@ export function mapKanbanEvent(event: KanbanEventEnvelope, deps: MapperDeps): Ma
     case 'action_log.appended': {
       const action = asNonEmptyString(payload.action);
       if (action === null) return { status: 'rejected', reason: 'missing_action' };
+      // An explicitly addressed agent outside the active team is rejected (docs §3) instead of
+      // being written with a placeholder index, which the UI would render as "System".
+      // A log with no `agentIndex` at all is a system entry: `-1` is the store's System index.
+      const rawAgentIndex = payload.agentIndex ?? event.agentIndex;
+      if (rawAgentIndex !== undefined && rawAgentIndex !== null && !isKnownAgent(agentIndex)) {
+        return { status: 'rejected', reason: 'unknown_agent' };
+      }
       core.addLogEntry({
         agentIndex: isKnownAgent(agentIndex) ? agentIndex : -1,
         action,

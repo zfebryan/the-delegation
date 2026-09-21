@@ -51,7 +51,7 @@ dilewatkan tanpa perubahan (`passthrough`), jadi server §6.2 sungguhan tetap bi
 | `project.phase_changed {phase}` | `setPhase` |
 | `project.final_output {output}` | `setFinalOutput` + `setPhase('done')` |
 | `project.asset_ready {type,content}` | `setFinalAsset` (`music` → `audio`) + `setPhase('done')` |
-| `board.snapshot {tasks,phase,brief,agentStatuses}` | `applySnapshot` (aksi baru; id task eksternal dipakai apa adanya) |
+| `board.snapshot {tasks,phase,brief,agentStatuses}` | `applySnapshot` (aksi baru; id task eksternal dipakai apa adanya). `tasks` **wajib**: payload tanpanya ditolak (`missing_tasks`) supaya snapshot parsial tidak menghapus board; hanya `tasks: []` eksplisit yang boleh mengosongkan |
 | `task.created {task}` | `addTask` (menerima `id` eksternal; id duplikat diabaikan) |
 | `task.status_changed {taskId,status}` | `updateTaskStatus(..., {force:true})`, atau `reopenTask` bila `done → in_progress/on_hold` |
 | `task.output_ready {taskId,output}` | `setTaskOutput` |
@@ -65,7 +65,11 @@ dilewatkan tanpa perubahan (`passthrough`), jadi server §6.2 sungguhan tetap bi
 | `llm.usage {...}` | `addResponseLog` |
 
 Event/field yang tidak dikenal **diabaikan** (dicatat sebagai `ignored`/`rejected`), tidak
-memicu error. Event untuk `agentIndex` di luar tim aktif ditolak (bukan ditulis ke store).
+memicu error. Event untuk `agentIndex` di luar tim aktif ditolak (bukan ditulis ke store),
+termasuk `action_log.appended` yang menyebut agent di luar tim (`unknown_agent`).
+`action_log.appended` **tanpa** `agentIndex` tetap ditulis sebagai entri sistem dengan index
+`-1` — itu index "System" yang sudah dipakai `debugLog`, dan panel Activity menampilkannya
+sebagai `System` (bukan nama agent).
 
 ## 4. Egress (persiapan)
 
@@ -103,7 +107,7 @@ verifikasi dilakukan dengan membaca ulang kode + harness Node yang dibundel `esb
 (dependensi transitif vite, tanpa `npm install` tambahan):
 
 ```bash
-# 1) config + dedupe + mapper murni, store palsu (29 assertion)
+# 1) config + dedupe + mapper murni, store palsu (33 assertion)
 ./node_modules/.bin/esbuild scripts/kanban-transport/smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-smoke.mjs && node /tmp/kb-smoke.mjs
 
 # 2) adapter bridge → §6.2: pemetaan assignee/status, backlog, NACK, dedupe (38 assertion)
@@ -114,20 +118,27 @@ verifikasi dilakukan dengan membaca ulang kode + harness Node yang dibundel `esb
 
 # 4) heartbeat dengan WebSocket palsu (peer diam vs peer yang menjawab pong)
 ./node_modules/.bin/esbuild scripts/kanban-transport/heartbeat.ts --bundle --platform=node --format=esm --outfile=/tmp/kb-hb.mjs && node /tmp/kb-hb.mjs
+
+# 5) `KanbanTransport` nyata dengan WebSocket palsu: jumlah board.snapshot.request per
+#    connect/reconnect + snapshot parsial tidak menghapus board (env di-inline karena
+#    `config.ts` membaca import.meta.env milik Vite)
+./node_modules/.bin/esbuild scripts/kanban-transport/snapshot-request-probe.ts --bundle --platform=node --format=esm --define:'import.meta.env={"VITE_KANBAN_WS_URL":"ws://fake/ws","VITE_KANBAN_TRANSPORT_MODE":"remote","VITE_KANBAN_WS_RECONNECT_MIN_MS":"10","VITE_KANBAN_WS_RECONNECT_MAX_MS":"10","VITE_KANBAN_WS_HEARTBEAT_MS":"60000"}' --outfile=/tmp/kb-snap.mjs && node /tmp/kb-snap.mjs
 ```
 
-Keempat harness TypeScript di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut
+Kelima harness TypeScript di `scripts/kanban-transport/` memakai `@ts-nocheck` supaya tidak ikut
 menambah diagnostik ke `npm run lint`, dan tidak menarik dependensi baru (`esbuild` ikut bersama
 vite). `old-rule-probe.mjs` (JS murni, `node` langsung) hanya untuk mereproduksi aturan liveness
 lama; lihat §5.
 
 Hasil terakhir (host 4 GB, bridge hidup di `ws://127.0.0.1:8000/ws`): harness (1)
-`ALL CHECKS PASSED` (29 assertion); (2) `ALL CHECKS PASSED` (38 assertion, adapter); (3) lihat
+`ALL CHECKS PASSED` (33 assertion); (2) `ALL CHECKS PASSED` (38 assertion, adapter); (3) lihat
 §7.6 — frame `backlog` nyata jadi `applied:board.snapshot`, 2 frame `status_changed` yang datang
 **live** jadi `applied:task.status_changed`, dan event di dalam backlog (`task_added`,
 `status_changed`) jadi `applied:task.created` / `applied:task.status_changed` saat di-replay,
 0 reconnect; (4) peer diam → tetap `online` tanpa close paksa, peer yang menjawab `pong` lalu diam →
-`heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan.
+`heartbeat timeout` lalu socket ditutup dan reconnect dijadwalkan; (5) `ALL CHECKS PASSED`
+(1 `board.snapshot.request` per connect dan per reconnect, `missing_tasks` tidak menyentuh store,
+`tasks: []` tetap mengosongkan).
 
 Sebelum merge, jalankan `npm ci && npm run lint && npm run build` di mesin yang punya RAM cukup:
 
@@ -223,3 +234,25 @@ pertama terhitung contiguous (bukan baseline baru). Bisa dimatikan dengan
   lewat adapter yang sama → `applied:task.created` ×4 + `applied:task.status_changed` ×4 dengan
   store task in-memory (bukan lagi `ignored:unknown_type`). Satu `ignored:unknown_task` memang
   benar: kartu `t_8b8a8054` dibuat sebelum buffer bridge dimulai, jadi `task_added`-nya tidak ada.
+
+### 7.7 Perbaikan pasca-review QA
+
+Tiga temuan review QA (kartu `t_5a298d2d` → `t_4002d267`) sudah diperbaiki:
+
+1. **`board.snapshot` tanpa `tasks` tidak lagi menghapus board.** Sebelumnya payload parsial
+   (server lain versi, event terpotong) dianggap "board kosong" dan `applySnapshot([])` menghapus
+   semua task lokal — padahal event ini justru jalur resync. Sekarang ditolak
+   (`missing_tasks`), sementara `tasks: []` eksplisit tetap mengosongkan board.
+2. **Satu `board.snapshot.request` per reconnect.** `onStateChange('online')` dan `onReconnected`
+   sama-sama meminta snapshot, jadi tiap reconnect mengirim dua frame (counter naik 2×).
+   Sekarang `onStateChange` hanya meminta pada connect **pertama** (`connected`), reconnect lewat
+   `onReconnected` (`reconnected`).
+3. **`action_log.appended` untuk agent di luar tim ditolak** (`unknown_agent`) supaya sesuai §3:
+   sebelumnya entri itu ditulis dengan `agentIndex: -1` dan tampil sebagai "System" di panel
+   Activity, seolah bukan dari agent. Entri tanpa `agentIndex` tetap `-1`/System.
+
+Harness `smoke.ts` bertambah 4 assertion (33 total: snapshot tanpa `tasks`, snapshot `tasks: []`,
+log System, log agent luar tim) dan ada harness baru `snapshot-request-probe.ts` yang menjalankan
+`KanbanTransport` sungguhan di atas WebSocket palsu. Probe itu gagal pada kode lama
+(3 request setelah 1 reconnect: `connected` + `reconnected`) dan lulus setelah perbaikan
+(1 request per connect/reconnect).

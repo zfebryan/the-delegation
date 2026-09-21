@@ -111,6 +111,11 @@ check('agent.status_changed unknown agent rejected', run({ type: 'agent.status_c
 check('agent.message appends history', run({ type: 'agent.message', agentIndex: 3, payload: { role: 'assistant', content: 'hi' } }).calls, ['appendAgentHistory:3:assistant:hi']);
 check('agent.replace_history replaces', run({ type: 'agent.replace_history', agentIndex: 1, payload: { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }] } }).calls, ['setAgentHistory:1:2']);
 check('action_log.appended', run({ type: 'action_log.appended', payload: { agentIndex: 1, action: 'Started task', taskId: 'board-7' } }).calls, ['addLogEntry:1:Started task']);
+check('action_log.appended without agentIndex is a System entry', run({ type: 'action_log.appended', payload: { action: 'board poll recovered' } }).calls, ['addLogEntry:-1:board poll recovered']);
+check('action_log.appended for an out-of-team agent is rejected', (() => {
+  const { result, calls } = run({ type: 'action_log.appended', payload: { agentIndex: 9, action: 'Started task' } });
+  return { result, calls };
+})(), { result: { status: 'rejected', reason: 'unknown_agent' }, calls: [] });
 check('llm.usage accumulates tokens', run({ type: 'llm.usage', agentIndex: 2, payload: { promptTokens: 10, completionTokens: 5 } }).calls, ['addResponseLog:2:15']);
 
 check('board.snapshot replaces the board', run({
@@ -125,6 +130,16 @@ check('board.snapshot replaces the board', run({
     agentStatuses: { 1: 'working', 9: 'idle' },
   },
 }).calls, ['applySnapshot:b1/in_progress:working:{"1":"working"}']);
+
+check('board.snapshot without tasks is rejected (never wipes the board)', (() => {
+  const { result, calls } = run({ type: 'board.snapshot', payload: {} });
+  return { result, calls };
+})(), { result: { status: 'rejected', reason: 'missing_tasks' }, calls: [] });
+
+check('board.snapshot with explicit empty tasks clears the board', run({
+  type: 'board.snapshot',
+  payload: { tasks: [] },
+}).calls, ['applySnapshot::undefined:{}']);
 
 check('project.brief_received → startProject', run({ type: 'project.brief_received', payload: { brief: 'Landing page' } }).calls, ['startProject:Landing page']);
 check('project.asset_ready maps music→audio', run({ type: 'project.asset_ready', payload: { type: 'music', content: 'data:audio' } }).calls, ['setFinalAsset:audio:data:audio', 'setPhase:done']);

@@ -28,6 +28,8 @@ export class KanbanTransport {
   private dedupe = new EventDedupe(transportConfig.dedupeCacheSize);
   private unsubs: (() => void)[] = [];
   private started = false;
+  /** Guards the one-time `board.snapshot.request` on the first connect (see `onStateChange`). */
+  private requestedInitialSnapshot = false;
   /** Dedupe keys for NACKs already sent (bounded, see `sendNacks`). */
   private nackedKeys = new Set<string>();
 
@@ -60,7 +62,12 @@ export class KanbanTransport {
       onEvent: (event) => this.handleFrame(event),
       onStateChange: (state) => {
         useTransportStore.getState().setConnectionState(state);
-        if (state === 'online') this.requestSnapshot('connected');
+        // Only the *first* successful connect asks here; every later one goes through
+        // `onReconnected`. Requesting from both paths sent two `board.snapshot.request`
+        // frames per reconnect (observed as a 2× `snapshotRequests` counter).
+        if (state !== 'online' || this.requestedInitialSnapshot) return;
+        this.requestedInitialSnapshot = true;
+        this.requestSnapshot('connected');
       },
       onReconnected: () => {
         // A new socket may have missed events: drop dedupe state and resync from a snapshot.
@@ -89,6 +96,7 @@ export class KanbanTransport {
     this.unsubs = [];
     this.dedupe.reset();
     this.nackedKeys.clear();
+    this.requestedInitialSnapshot = false;
     this.started = false;
     useTransportStore.getState().setConnectionState(isRemoteMode() ? 'offline' : 'disabled');
   }
